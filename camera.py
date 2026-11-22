@@ -1,6 +1,9 @@
 import argparse
 import cv2
 import os
+import shutil
+import signal
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -19,8 +22,12 @@ parser.add_argument("--fps", type=int, default=15)
 parser.add_argument("--sensitivity", type=float, default=25.0,
                     help="Motion threshold percentage (lower = more sensitive)")
 parser.add_argument("--cooldown", type=float, default=10.0,
-                    help="Seconds to keep recording after last motion")
+                    help="Seconds to keep recording after last visual motion")
 parser.add_argument("--recordings", default="recordings")
+parser.add_argument("--audio-device", default="default",
+                    help="FFmpeg ALSA input device (e.g. default or hw:1,0)")
+parser.add_argument("--no-audio", action="store_true",
+                    help="Record video without audio")
 args = parser.parse_args()
 
 recordings_dir = Path(args.recordings).resolve()
@@ -34,6 +41,9 @@ last_motion = 0.0
 recording = False
 writer = None
 recording_path = None
+video_temp_path = None
+audio_temp_path = None
+audio_process = None
 camera_error = None
 
 camera = cv2.VideoCapture(args.camera)
@@ -49,8 +59,79 @@ PAGE = r'''<!doctype html>
 <script>async function update(){const s=await (await fetch('/api/status')).json();const el=document.getElementById('status');el.textContent=s.recording?'RECORDING':(s.motion?'MOTION':'Idle');el.className='badge '+(s.recording?'live':(s.motion?'live':''));const f=await (await fetch('/api/recordings')).json();const table=document.getElementById('files');table.innerHTML='<tr><th>Name</th><th>Size</th><th>Download</th></tr>'+f.map(x=>'<tr><td>'+x.name+'</td><td>'+x.size_mb+' MB</td><td><a href="/recordings/'+encodeURIComponent(x.name)+'" target="_blank">Open</a></td></tr>').join('')}update();setInterval(update,2000);</script></body></html>'''
 
 
+def start_audio(path):
+    """Capture audio independently; audio is never consulted for motion detection."""
+    if args.no_audio:
+        return None
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("FFmpeg is required for audio; install ffmpeg or use --no-audio")
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "alsa", "-i", args.audio_device,
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", str(path),
+    ]
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def finish_recording():
+    """Close temporary tracks, mux audio into the final MP4, then clean up."""
+    global writer, recording, audio_process, video_temp_path, audio_temp_path
+    global camera_error
+
+    if writer is not None:
+        writer.release()
+        writer = None
+
+    audio_ok = args.no_audio
+    if audio_process is not None:
+        process = audio_process
+        audio_process = None
+        process.send_signal(signal.SIGINT)
+        try:
+            stderr = process.communicate(timeout=10)[1]
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stderr = process.communicate()[1]
+        audio_ok = process.returncode == 0 and audio_temp_path.exists() and audio_temp_path.stat().st_size > 44
+        if not audio_ok:
+            details = stderr.decode("utf-8", errors="replace").strip()
+            camera_error = "Audio capture failed" + (f": {details[-500:]}" if details else "")
+
+    try:
+        if video_temp_path is None or not video_temp_path.exists():
+            return
+        if audio_ok and not args.no_audio:
+            command = [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(video_temp_path), "-i", str(audio_temp_path),
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                "-shortest", "-movflags", "+faststart", str(recording_path),
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                camera_error = "Could not combine audio and video: " + result.stderr[-500:]
+                # Preserve usable silent footage if muxing fails.
+                os.replace(video_temp_path, recording_path)
+        else:
+            os.replace(video_temp_path, recording_path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        camera_error = f"Could not finalize recording: {exc}"
+    finally:
+        for path in (video_temp_path, audio_temp_path):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        video_temp_path = None
+        audio_temp_path = None
+        recording = False
+
+
 def capture_loop():
-    global latest_frame, motion_active, last_motion, recording, writer, recording_path, camera_error
+    global latest_frame, motion_active, last_motion, recording, writer
+    global recording_path, video_temp_path, audio_temp_path, audio_process, camera_error
     previous = None
 
     while True:
@@ -61,10 +142,11 @@ def capture_loop():
             continue
 
         camera_error = None
-        motion = False
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
+        # Triggering is deliberately based only on video-frame differences.
+        motion = False
         if previous is not None:
             delta = cv2.absdiff(previous, gray)
             _, thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)
@@ -84,18 +166,29 @@ def capture_loop():
             if not recording:
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 recording_path = recordings_dir / f"motion-{stamp}.mp4"
+                video_temp_path = recordings_dir / f".motion-{stamp}.video.mp4"
+                audio_temp_path = recordings_dir / f".motion-{stamp}.audio.wav"
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(str(recording_path), fourcc, args.fps,
+                writer = cv2.VideoWriter(str(video_temp_path), fourcc, args.fps,
                                          (frame.shape[1], frame.shape[0]))
-                recording = writer.isOpened()
-                if not recording:
+                if not writer.isOpened():
+                    writer.release()
+                    writer = None
                     camera_error = "Could not create video file"
-            if recording:
+                    video_temp_path = None
+                    audio_temp_path = None
+                else:
+                    recording = True
+                    try:
+                        audio_process = start_audio(audio_temp_path)
+                    except (OSError, RuntimeError) as exc:
+                        camera_error = str(exc)
+                        audio_process = None
+                        # Video continues to record if audio setup fails.
+            if recording and writer is not None:
                 writer.write(frame)
         elif recording and time.monotonic() - last_motion >= args.cooldown:
-            writer.release()
-            writer = None
-            recording = False
+            finish_recording()
 
         time.sleep(max(0.001, 1.0 / args.fps))
 
