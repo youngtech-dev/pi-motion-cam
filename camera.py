@@ -24,9 +24,8 @@ parser.add_argument("--height", type=int, default=480)
 parser.add_argument("--fps", type=int, default=15)
 parser.add_argument("--sensitivity", type=float, default=25.0)
 parser.add_argument("--cooldown", type=float, default=10.0,
-                    help="Seconds to keep recording after last visual motion")
-parser.add_argument("--pre-roll", type=float, default=3.0,
-                    help="Seconds of video buffered before motion and prepended to recording")
+                    help="Seconds after the last detected visual motion")
+parser.add_argument("--pre-roll", type=float, default=5.0)
 parser.add_argument("--recordings", default="recordings")
 parser.add_argument("--audio-device", default="default")
 parser.add_argument("--audio-rate", type=int, default=16000)
@@ -82,9 +81,6 @@ audio_temp_path = None
 audio_process = None
 audio_log = None
 camera_error = None
-# Store only the most recent frames while idle so the clip contains the approach
-# and the first motion that triggered detection. At 640x480 BGR, 3 seconds is
-# roughly 40 MB at 15 fps.
 pre_roll = deque(maxlen=max(1, round(args.fps * max(0.0, args.pre_roll))))
 
 camera = cv2.VideoCapture(args.camera)
@@ -98,13 +94,7 @@ PAGE = r'''<!doctype html>
 <body><h1>Pi Motion Camera</h1><p>Status: <span id="status" class="badge">Loading</span></p><p id="error"></p>
 <img src="/stream" alt="Live camera"><h2>Recordings</h2><table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody id="files"></tbody></table>
 <script>
-async function update(){
- try{const s=await (await fetch('/api/status',{cache:'no-store'})).json();
-  const badge=document.getElementById('status');badge.textContent=s.recording?'RECORDING':(s.motion?'MOTION':'Idle');badge.className='badge '+(s.recording||s.motion?'live':'');document.getElementById('error').textContent=s.camera_error||'';
-  const files=await (await fetch('/api/recordings',{cache:'no-store'})).json();const body=document.getElementById('files');body.replaceChildren();
-  for(const f of files){const row=document.createElement('tr');const a=document.createElement('a');a.href='/recordings/'+encodeURIComponent(f.name);a.textContent='Download';const d=document.createElement('button');d.textContent='Delete';d.onclick=async()=>{if(confirm('Permanently delete '+f.name+'?')){const r=await fetch('/api/recordings/'+encodeURIComponent(f.name),{method:'DELETE'});if(r.ok)update();else alert((await r.json()).error||'Delete failed')}};const c=document.createElement('td');c.append(a,document.createTextNode(' '),d);row.append(Object.assign(document.createElement('td'),{textContent:f.name}),Object.assign(document.createElement('td'),{textContent:f.size_mb+' MB'}),c);body.append(row)}
- }catch(e){document.getElementById('error').textContent='Web request failed: '+e.message}}
-update();setInterval(update,2000);
+async function update(){try{const s=await (await fetch('/api/status',{cache:'no-store'})).json();const b=document.getElementById('status');b.textContent=s.recording?'RECORDING':(s.motion?'MOTION':'Idle');b.className='badge '+(s.recording||s.motion?'live':'');document.getElementById('error').textContent=s.camera_error||'';const files=await (await fetch('/api/recordings',{cache:'no-store'})).json();const body=document.getElementById('files');body.replaceChildren();for(const f of files){const row=document.createElement('tr');const a=document.createElement('a');a.href='/recordings/'+encodeURIComponent(f.name);a.textContent='Download';const d=document.createElement('button');d.textContent='Delete';d.onclick=async()=>{if(confirm('Permanently delete '+f.name+'?')){const r=await fetch('/api/recordings/'+encodeURIComponent(f.name),{method:'DELETE'});if(r.ok)update();else alert((await r.json()).error||'Delete failed')}};const c=document.createElement('td');c.append(a,document.createTextNode(' '),d);row.append(Object.assign(document.createElement('td'),{textContent:f.name}),Object.assign(document.createElement('td'),{textContent:f.size_mb+' MB'}),c);body.append(row)}}catch(e){document.getElementById('error').textContent='Web request failed: '+e.message}}update();setInterval(update,2000);
 </script></body></html>'''
 
 
@@ -117,8 +107,8 @@ def start_audio(path):
     audio_log = tempfile.TemporaryFile(mode="w+b")
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
                "-f", "alsa", "-sample_rate", str(args.audio_rate), "-channels", "1",
-               "-i", args.audio_device, "-t", str(60 * 60), "-vn", "-ac", "1",
-               "-ar", str(args.audio_rate), "-c:a", "pcm_s16le", "-f", "wav", "-y", str(path)]
+               "-i", args.audio_device, "-vn", "-ac", "1", "-ar", str(args.audio_rate),
+               "-c:a", "pcm_s16le", "-f", "wav", "-y", str(path)]
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=audio_log)
     time.sleep(0.5)
@@ -189,6 +179,14 @@ def finish_recording():
             recording = False
 
 
+def add_timestamp(frame):
+    # Top-left timestamp overlay: wall-clock date and time with tenths of a second.
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.monotonic()*10)%10}"
+    cv2.rectangle(frame, (8, 8), (330, 45), (0, 0, 0), cv2.FILLED)
+    cv2.putText(frame, stamp, (14, 35), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+
 def capture_loop():
     global latest_frame, motion_active, last_motion, recording, writer
     global recording_path, video_temp_path, audio_temp_path, audio_process, camera_error
@@ -199,6 +197,7 @@ def capture_loop():
             camera_error = "Could not read from the camera"
             time.sleep(1)
             continue
+
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0)
         motion = False
         if previous is not None:
@@ -209,15 +208,17 @@ def capture_loop():
         previous = gray
         now = time.monotonic()
 
+        # The timestamp is applied once to the frame stored for live view and recording.
+        add_timestamp(frame)
+
         if motion:
+            # This is the only timestamp used by the cooldown. Every real visual
+            # motion updates it, even while the same recording remains open.
             last_motion = now
         with lock:
             latest_frame = frame.copy()
             motion_active = motion
 
-        # Keep a rolling pre-event video buffer while idle. It is flushed into
-        # the file when motion is detected, so detection/write startup latency
-        # does not trim off the beginning of the event.
         pre_roll.append(frame.copy())
         started_recording = False
         if motion and not recording:
@@ -245,10 +246,11 @@ def capture_loop():
                         audio_process = None
                         camera_error = str(exc)
 
-        # The current frame is already in pre_roll and was written above when
-        # recording starts. Thereafter write every frame, including idle frames.
-        if recording and writer is not None and not started_recording:
-            writer.write(frame)
+        # A second movement never opens or replaces the clip: it resets last_motion
+        # while all subsequent frames continue to be written to this one file.
+        if recording and writer is not None:
+            if not started_recording:
+                writer.write(frame)
 
         if recording and now - last_motion >= args.cooldown:
             finish_recording()
