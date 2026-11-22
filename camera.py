@@ -24,11 +24,11 @@ parser.add_argument("--width", type=int, default=640)
 parser.add_argument("--height", type=int, default=480)
 parser.add_argument("--fps", type=int, default=15)
 parser.add_argument("--sensitivity", type=float, default=25.0)
-parser.add_argument("--cooldown", type=float, default=10.0,
+parser.add_argument("--cooldown", type=float, default=40.0,
                     help="Seconds after the last detected visual motion")
 parser.add_argument("--pre-roll", type=float, default=5.0)
 parser.add_argument("--recordings", default="recordings")
-parser.add_argument("--audio-device", default="default")
+parser.add_argument("--audio-device", default="plughw:1,0")
 parser.add_argument("--audio-rate", type=int, default=16000)
 parser.add_argument("--no-audio", action="store_true")
 parser.add_argument("--test-audio", action="store_true")
