@@ -1,10 +1,8 @@
 # pi-motion-cam
 
-A headless motion-activated USB webcam recorder for Raspberry Pi OS. It records MP4 video with webcam audio, provides an MJPEG live stream, and lists, downloads, and deletes recordings in a small Flask web interface. Motion detection uses video frames only; microphone audio never triggers a recording.
+Headless motion-activated USB webcam recorder for Raspberry Pi OS. Saves MP4 video with the webcam microphone, serves an MJPEG live view, and allows completed recordings to be downloaded or deleted. Motion detection is video-only; sound never triggers recording.
 
-## Hardware and install
-
-- Raspberry Pi 3B or newer and a Linux-compatible USB webcam with microphone.
+## Install
 
 ```bash
 sudo apt update
@@ -16,51 +14,64 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On Raspberry Pi OS 32-bit, if the OpenCV pip package is unavailable, install `python3-opencv` with apt and then `pip install Flask numpy`.
+## Diagnose the microphone first
 
-## Find and test the webcam microphone
-
-The USB webcam microphone is a separate ALSA capture device; it is not automatically selected just because the camera is selected. Find its card/device numbers:
+The camera and its microphone are separate Linux devices. `plughw:1,0` is only an example: USB card numbers can change, and the actual webcam mic might not be card 1. List capture devices:
 
 ```bash
 arecord -l
+arecord -L
 ```
 
-For example, `card 1, device 0` is usually addressed as `plughw:1,0`. `plughw` is preferable to `hw` because it allows ALSA to convert supported rates and channel counts. Test the device before starting the service:
+Test the exact capture device reported by the Pi (replace `plughw:1,0` as needed):
 
 ```bash
 arecord -D plughw:1,0 -f S16_LE -r 16000 -c 1 -d 5 /tmp/mic-test.wav
 aplay /tmp/mic-test.wav
 ```
 
-Run the app with that same device:
+Then use the same device with the app's built-in FFmpeg test:
 
 ```bash
-python3 camera.py --camera 0 --audio-device plughw:1,0 --port 8080
+.venv/bin/python camera.py --audio-device plughw:1,0 --test-audio
 ```
 
-Use the actual card/device numbers reported on your Pi. If `arecord` reports permission denied while running as a service, add that service user to the `audio` group (`sudo usermod -aG audio YOUR_USER`) and restart the service/login. Inspect errors via `/api/status` or `sudo journalctl -u pi-motion-cam.service -f`. Audio is recorded independently through FFmpeg/ALSA; audio levels do not participate in motion detection.
+This test reports FFmpeg/ALSA errors directly and exits without starting the camera server. If `arecord` succeeds but this test fails, check `ffmpeg` installation and device busy/permissions. If running under systemd, make sure the service uses the same device and user permissions; after editing the unit, reload and restart:
 
-Open `http://raspberrypi.local:8080/` from another machine. Stop a foreground run with `Ctrl+C`.
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart pi-motion-cam.service
+sudo journalctl -u pi-motion-cam.service -n 100 --no-pager
+```
+
+The web status displays the configured audio device and any current capture/finalization error. Audio capture is separate from visual motion detection.
 
 ## Run at boot
 
-Edit `pi-motion-cam.service`: replace `YOUR_USER` and set `--audio-device` to the tested ALSA device (for example `plughw:1,0`). Then:
+Edit `pi-motion-cam.service`: replace `YOUR_USER`, check the working directory, and set `--audio-device` to the actual ALSA device tested above. Then install/restart:
 
 ```bash
 sudo cp pi-motion-cam.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pi-motion-cam.service
-sudo systemctl status pi-motion-cam.service
-sudo journalctl -u pi-motion-cam.service -f
 ```
 
-## Configuration
+The service includes the `audio` supplementary group. If the service user still receives permission errors, verify `arecord` works as that user and check the system journal.
 
-`camera.py` supports `--camera`, `--host`, `--port`, `--width`, `--height`, `--fps`, `--sensitivity`, `--cooldown`, `--recordings`, `--audio-device`, and `--no-audio`. The default cooldown is 10 seconds and recording continues writing every video frame until ten seconds after the last detected visual motion. Further motion resets that timer.
+## Run manually
 
-## Web interface and security
+```bash
+.venv/bin/python camera.py --camera 0 --audio-device plughw:1,0 --port 8080
+```
 
-The home page shows the live video and completed recordings. Use Download or Delete beside a recording; deletion asks for confirmation and is permanent. A recording in progress cannot be deleted. The live `/stream` endpoint is video-only MJPEG; saved MP4 recordings include audio when the ALSA device is available. If audio cannot start, the app continues recording silent video and reports the cause in `/api/status`.
+Open `http://raspberrypi.local:8080/` from another device on the network. The app listens on port 8080 by default.
 
-Use a firewall/VPN or an encrypted reverse proxy before exposing this server beyond a trusted network. Monitor disk usage and remove recordings when needed.
+## Behavior and settings
+
+The app starts recording on detected visual motion and continues writing frames until `--cooldown` seconds after the last detected visual motion (10 seconds by default). Additional visual motion resets the timer. `--sensitivity` controls the changed-pixel percentage threshold. Saved MP4 audio is captured through FFmpeg/ALSA and muxed when recording finishes; the live MJPEG stream is video-only. Use `--no-audio` to disable audio.
+
+Available options include `--camera`, `--host`, `--port`, `--width`, `--height`, `--fps`, `--sensitivity`, `--cooldown`, `--recordings`, `--audio-device`, `--audio-rate`, `--no-audio`, and `--test-audio`.
+
+## Manage recordings and security
+
+The web page lists completed recordings with Download and Delete buttons. Delete prompts for confirmation; recordings currently being written cannot be deleted. Deletion is permanent. The web server currently has no authentication, so keep it on a trusted network or use a firewall/VPN before exposing it beyond your LAN.
