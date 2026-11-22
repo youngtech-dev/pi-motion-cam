@@ -34,17 +34,17 @@ sudo systemctl restart pi-motion-cam.service
 
 ## Recording behavior
 
-Motion starts recording only from visual frame differences. A recording continues writing every captured frame while idle and remains open for the full `--cooldown` period after the last motion frame. The default is 10 seconds. Further motion resets the countdown.
-
-For example:
+Motion starts recording only from visual frame differences. A rolling video buffer is maintained before detection and prepended to a new clip, so the first moments are captured even though motion detection needs a frame or two to recognize movement. The default pre-roll is 3 seconds (`--pre-roll`); increase it if needed. The video continues writing through idle frames until 10 seconds (`--cooldown`) after the last visual motion. Further visual motion resets the cooldown. The pre-roll applies to video; the audio track starts at detection.
 
 ```bash
-python3 camera.py --camera 0 --cooldown 10 --sensitivity 25
+python3 camera.py --camera 0 --pre-roll 3 --cooldown 10 --sensitivity 25
 ```
 
-The `RECORDING` status remains true for the cooldown. `--sensitivity` controls what counts as visual motion; lower values are more sensitive.
+The pre-roll ring buffer uses RAM (about 40 MB at 640x480, 15 FPS, and 3 seconds). `--sensitivity` controls what counts as motion; lower values are more sensitive.
 
 ## Run at boot
+
+Edit `pi-motion-cam.service`, replacing `YOUR_USER` and setting the correct audio device. Then:
 
 ```bash
 sudo cp pi-motion-cam.service /etc/systemd/system/
@@ -52,4 +52,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pi-motion-cam.service
 ```
 
-Open `http://raspberrypi.local:8080/`. Completed MP4s have Download and Delete controls. The live stream is MJPEG and saved recordings combine webcam video and microphone audio when ALSA works.
+If you change options, edit the unit file, then run `sudo systemctl daemon-reload && sudo systemctl restart pi-motion-cam.service`.
+
+Open `http://raspberrypi.local:8080/`. Completed MP4s have Download and Delete controls. The live stream is MJPEG; saved recordings combine webcam video and microphone audio when ALSA works.

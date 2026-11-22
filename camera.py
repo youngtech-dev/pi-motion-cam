@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,8 @@ parser.add_argument("--fps", type=int, default=15)
 parser.add_argument("--sensitivity", type=float, default=25.0)
 parser.add_argument("--cooldown", type=float, default=10.0,
                     help="Seconds to keep recording after last visual motion")
+parser.add_argument("--pre-roll", type=float, default=3.0,
+                    help="Seconds of video buffered before motion and prepended to recording")
 parser.add_argument("--recordings", default="recordings")
 parser.add_argument("--audio-device", default="default")
 parser.add_argument("--audio-rate", type=int, default=16000)
@@ -79,6 +82,10 @@ audio_temp_path = None
 audio_process = None
 audio_log = None
 camera_error = None
+# Store only the most recent frames while idle so the clip contains the approach
+# and the first motion that triggered detection. At 640x480 BGR, 3 seconds is
+# roughly 40 MB at 15 fps.
+pre_roll = deque(maxlen=max(1, round(args.fps * max(0.0, args.pre_roll))))
 
 camera = cv2.VideoCapture(args.camera)
 camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -202,13 +209,17 @@ def capture_loop():
         previous = gray
         now = time.monotonic()
 
-        # Reset the timeout on every frame that the new algorithm classifies as motion.
         if motion:
             last_motion = now
         with lock:
             latest_frame = frame.copy()
             motion_active = motion
 
+        # Keep a rolling pre-event video buffer while idle. It is flushed into
+        # the file when motion is detected, so detection/write startup latency
+        # does not trim off the beginning of the event.
+        pre_roll.append(frame.copy())
+        started_recording = False
         if motion and not recording:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             recording_path = recordings_dir / f"motion-{stamp}.mp4"
@@ -223,6 +234,9 @@ def capture_loop():
             else:
                 with lock:
                     recording = True
+                started_recording = True
+                for buffered_frame in pre_roll:
+                    writer.write(buffered_frame)
                 if not args.no_audio:
                     try:
                         audio_process = start_audio(audio_temp_path)
@@ -231,12 +245,12 @@ def capture_loop():
                         audio_process = None
                         camera_error = str(exc)
 
-        # Crucial: write every frame while recording, including frames classified as idle.
-        if recording and writer is not None:
+        # The current frame is already in pre_roll and was written above when
+        # recording starts. Thereafter write every frame, including idle frames.
+        if recording and writer is not None and not started_recording:
             writer.write(frame)
 
-        elapsed = now - last_motion
-        if recording and elapsed >= args.cooldown:
+        if recording and now - last_motion >= args.cooldown:
             finish_recording()
 
         time.sleep(max(0.001, 1.0 / args.fps))
@@ -268,7 +282,7 @@ def status():
         return jsonify(motion=motion_active, recording=recording,
                        camera_error=camera_error,
                        recording_file=recording_path.name if recording_path else None,
-                       cooldown_seconds=args.cooldown)
+                       cooldown_seconds=args.cooldown, pre_roll_seconds=args.pre_roll)
 
 
 @app.route("/api/recordings", methods=["GET"])
