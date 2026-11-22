@@ -1,0 +1,14 @@
+[Unit]
+Description=Pi Motion Camera
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/pi-motion-cam
+ExecStart=/home/YOUR_USER/pi-motion-cam/.venv/bin/python camera.py --camera 0 --host 0.0.0.0 --port 8080 --width 640 --height 480 --fps 15 --sensitivity 25 --cooldown 10 --recordings /home/YOUR_USER/pi-motion-cam/recordings
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
