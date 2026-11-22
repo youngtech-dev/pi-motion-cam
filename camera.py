@@ -1,6 +1,7 @@
 import argparse
 import cv2
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -42,12 +43,12 @@ def test_audio_device():
     fd, filename = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     try:
-        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                   "-f", "alsa", "-sample_rate", str(args.audio_rate), "-channels", "1",
-                   "-i", args.audio_device, "-t", str(args.audio_test_seconds), "-y", filename]
-        result = subprocess.run(command, capture_output=True, text=True,
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+               "-f", "alsa", "-sample_rate", str(args.audio_rate), "-channels", "1",
+               "-i", args.audio_device, "-t", str(args.audio_test_seconds), "-y", filename]
+        result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=args.audio_test_seconds + 10)
-        if result.returncode != 0 or os.path.getsize(filename) <= 44:
+        if result.returncode or os.path.getsize(filename) <= 44:
             print(result.stderr or "No audio samples captured", file=sys.stderr)
             return 1
         print("Audio test passed")
@@ -67,26 +68,29 @@ if args.test_audio:
 
 recordings_dir = Path(args.recordings).resolve()
 recordings_dir.mkdir(parents=True, exist_ok=True)
-
 app = Flask(__name__)
 lock = threading.RLock()
 latest_frame = None
 motion_active = False
 last_motion = 0.0
 recording = False
-writer = None
 recording_path = None
 video_temp_path = None
 audio_temp_path = None
 audio_process = None
 audio_log = None
+audio_error = None
 camera_error = None
+writer_queue = None
+writer_thread = None
 pre_roll = deque(maxlen=max(1, round(args.fps * max(0.0, args.pre_roll))))
+pre_roll_seconds_for_clip = 0.0
 
 camera = cv2.VideoCapture(args.camera)
 camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-camera.set(cv2.CAP_PROP_FPS, args.fps)
+# Keep camera latency low; the capture loop does not add a second FPS sleep.
+camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 PAGE = r'''<!doctype html>
 <html><head><meta name="viewport" content="width=device-width"><title>Pi Motion Camera</title>
@@ -98,6 +102,23 @@ async function update(){try{const s=await (await fetch('/api/status',{cache:'no-
 </script></body></html>'''
 
 
+def add_timestamp(frame):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.monotonic() * 10) % 10}"
+    cv2.rectangle(frame, (8, 8), (330, 45), (0, 0, 0), cv2.FILLED)
+    cv2.putText(frame, stamp, (14, 35), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def write_frames(video_writer, frames_queue):
+    """Drain queued live/pre-roll frames off the camera capture thread."""
+    while True:
+        frame = frames_queue.get()
+        if frame is None:
+            break
+        video_writer.write(frame)
+    video_writer.release()
+
+
 def start_audio(path):
     global audio_log
     if args.no_audio:
@@ -106,36 +127,38 @@ def start_audio(path):
         raise RuntimeError("ffmpeg is not installed")
     audio_log = tempfile.TemporaryFile(mode="w+b")
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
-               "-f", "alsa", "-sample_rate", str(args.audio_rate), "-channels", "1",
-               "-i", args.audio_device, "-vn", "-ac", "1", "-ar", str(args.audio_rate),
-               "-c:a", "pcm_s16le", "-f", "wav", "-y", str(path)]
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=audio_log)
-    time.sleep(0.5)
-    if process.poll() is not None:
-        audio_log.flush(); audio_log.seek(0)
-        details = audio_log.read().decode("utf-8", errors="replace")[-1000:].strip()
-        audio_log.close(); audio_log = None
-        raise RuntimeError("ALSA capture failed" + (f": {details}" if details else ""))
-    return process
+               "-thread_queue_size", "512", "-f", "alsa", "-sample_rate", str(args.audio_rate),
+               "-channels", "1", "-i", args.audio_device, "-vn", "-ac", "1",
+               "-ar", str(args.audio_rate), "-c:a", "pcm_s16le", "-f", "wav", "-y", str(path)]
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=audio_log)
 
 
-def audio_details():
+def close_audio_log():
     global audio_log
     if audio_log is None:
         return ""
     try:
-        audio_log.flush(); audio_log.seek(0)
+        audio_log.flush()
+        audio_log.seek(0)
         return audio_log.read().decode("utf-8", errors="replace")[-1000:].strip()
     finally:
-        audio_log.close(); audio_log = None
+        audio_log.close()
+        audio_log = None
 
 
 def finish_recording():
-    global writer, recording, audio_process, video_temp_path, audio_temp_path, camera_error
-    if writer is not None:
-        writer.release()
-        writer = None
+    global recording, writer_queue, writer_thread, audio_process
+    global video_temp_path, audio_temp_path, camera_error, audio_error
+    frames_queue = writer_queue
+    thread = writer_thread
+    writer_queue = None
+    writer_thread = None
+    if frames_queue is not None:
+        frames_queue.put(None)
+    if thread is not None:
+        thread.join()
+
     audio_ok = False
     if audio_process is not None:
         process = audio_process
@@ -145,22 +168,29 @@ def finish_recording():
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            process.kill(); process.wait()
-        details = audio_details()
+            process.kill()
+            process.wait()
+        details = close_audio_log()
         audio_ok = audio_temp_path is not None and audio_temp_path.exists() and audio_temp_path.stat().st_size > 44
         if not audio_ok:
             camera_error = "No usable audio captured" + (f": {details}" if details else "")
+
     try:
         if video_temp_path is None or not video_temp_path.exists():
             return
         if audio_ok:
-            result = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                                     "-i", str(video_temp_path), "-i", str(audio_temp_path),
-                                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                                     "-shortest", "-movflags", "+faststart", str(recording_path)],
-                                    capture_output=True, text=True, timeout=120)
-            if result.returncode != 0:
-                camera_error = "Mux failed; saved silent video: " + result.stderr[-500:]
+            # Video includes the pre-roll, whereas audio capture starts at motion.
+            # Delay audio by the pre-roll duration and do not use -shortest: that
+            # option used to truncate the end of the video by the pre-roll length.
+            delay_ms = round(pre_roll_seconds_for_clip * 1000)
+            result = subprocess.run([
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(video_temp_path), "-i", str(audio_temp_path),
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                "-af", f"adelay={delay_ms}:all=1", "-movflags", "+faststart",
+                str(recording_path)], capture_output=True, text=True, timeout=180)
+            if result.returncode:
+                camera_error = "Audio/video mux failed; saving full silent video: " + result.stderr[-500:]
                 os.replace(video_temp_path, recording_path)
         else:
             os.replace(video_temp_path, recording_path)
@@ -175,87 +205,90 @@ def finish_recording():
                     pass
         video_temp_path = None
         audio_temp_path = None
+        audio_error = None
         with lock:
             recording = False
 
 
-def add_timestamp(frame):
-    # Top-left timestamp overlay: wall-clock date and time with tenths of a second.
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.monotonic()*10)%10}"
-    cv2.rectangle(frame, (8, 8), (330, 45), (0, 0, 0), cv2.FILLED)
-    cv2.putText(frame, stamp, (14, 35), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (255, 255, 255), 2, cv2.LINE_AA)
-
-
 def capture_loop():
-    global latest_frame, motion_active, last_motion, recording, writer
-    global recording_path, video_temp_path, audio_temp_path, audio_process, camera_error
-    previous = None
+    global latest_frame, motion_active, last_motion, recording
+    global recording_path, video_temp_path, audio_temp_path, audio_process
+    global writer_queue, writer_thread, camera_error, audio_error, pre_roll_seconds_for_clip
+    previous_gray = None
+
     while True:
         ok, frame = camera.read()
         if not ok:
             camera_error = "Could not read from the camera"
-            time.sleep(1)
+            time.sleep(0.2)
             continue
 
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0)
         motion = False
-        if previous is not None:
-            delta = cv2.absdiff(previous, gray)
+        if previous_gray is not None:
+            delta = cv2.absdiff(previous_gray, gray)
             _, thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)
             changed = np.count_nonzero(cv2.dilate(thresh, None, iterations=2)) / thresh.size * 100.0
             motion = changed >= args.sensitivity
-        previous = gray
+        previous_gray = gray
         now = time.monotonic()
-
-        # The timestamp is applied once to the frame stored for live view and recording.
         add_timestamp(frame)
 
         if motion:
-            # This is the only timestamp used by the cooldown. Every real visual
-            # motion updates it, even while the same recording remains open.
+            # Reset on every motion frame; all motion events share the open clip.
             last_motion = now
         with lock:
             latest_frame = frame.copy()
             motion_active = motion
 
         pre_roll.append(frame.copy())
-        started_recording = False
+        started = False
         if motion and not recording:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             recording_path = recordings_dir / f"motion-{stamp}.mp4"
             video_temp_path = recordings_dir / f".motion-{stamp}.video.mp4"
             audio_temp_path = recordings_dir / f".motion-{stamp}.audio.wav"
-            writer = cv2.VideoWriter(str(video_temp_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                                     args.fps, (frame.shape[1], frame.shape[0]))
-            if not writer.isOpened():
-                writer.release(); writer = None
+            video_writer = cv2.VideoWriter(str(video_temp_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                           args.fps, (frame.shape[1], frame.shape[0]))
+            if not video_writer.isOpened():
+                video_writer.release()
+                video_writer = None
                 camera_error = "Could not create video file"
-                video_temp_path = None; audio_temp_path = None
+                video_temp_path = None
+                audio_temp_path = None
             else:
+                writer_queue = queue.Queue()
+                buffered = list(pre_roll)
+                pre_roll_seconds_for_clip = max(0, len(buffered) - 1) / float(args.fps)
+                writer_thread = threading.Thread(target=write_frames,
+                                                 args=(video_writer, writer_queue), daemon=True)
+                writer_thread.start()
                 with lock:
                     recording = True
-                started_recording = True
-                for buffered_frame in pre_roll:
-                    writer.write(buffered_frame)
-                if not args.no_audio:
-                    try:
-                        audio_process = start_audio(audio_temp_path)
-                        camera_error = None
-                    except (OSError, RuntimeError) as exc:
-                        audio_process = None
-                        camera_error = str(exc)
+                for buffered_frame in buffered:
+                    writer_queue.put(buffered_frame)
+                started = True
+                audio_error = None
+                try:
+                    audio_process = start_audio(audio_temp_path)
+                except (OSError, RuntimeError) as exc:
+                    audio_process = None
+                    audio_error = str(exc)
+                    camera_error = audio_error
 
-        # A second movement never opens or replaces the clip: it resets last_motion
-        # while all subsequent frames continue to be written to this one file.
-        if recording and writer is not None:
-            if not started_recording:
-                writer.write(frame)
+        if recording and writer_queue is not None and not started:
+            # Queueing is fast and non-blocking for camera capture. This preserves
+            # frames during pre-roll flush and while the encoder catches up.
+            writer_queue.put(frame.copy())
+
+        if audio_process is not None and audio_process.poll() is not None:
+            details = close_audio_log()
+            audio_process = None
+            audio_error = "Audio capture stopped unexpectedly" + (f": {details}" if details else "")
+            camera_error = audio_error
 
         if recording and now - last_motion >= args.cooldown:
             finish_recording()
-
-        time.sleep(max(0.001, 1.0 / args.fps))
 
 
 @app.route("/")
@@ -270,11 +303,11 @@ def stream():
             with lock:
                 frame = None if latest_frame is None else latest_frame.copy()
             if frame is None:
-                time.sleep(0.05); continue
+                time.sleep(0.05)
+                continue
             ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded.tobytes() + b"\r\n"
-            time.sleep(1.0 / args.fps)
     return Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -282,8 +315,7 @@ def stream():
 def status():
     with lock:
         return jsonify(motion=motion_active, recording=recording,
-                       camera_error=camera_error,
-                       recording_file=recording_path.name if recording_path else None,
+                       camera_error=camera_error, recording_file=recording_path.name if recording_path else None,
                        cooldown_seconds=args.cooldown, pre_roll_seconds=args.pre_roll)
 
 
