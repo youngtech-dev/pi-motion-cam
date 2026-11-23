@@ -27,7 +27,7 @@ parser.add_argument("--port", type=int, default=8080)
 parser.add_argument("--width", type=int, default=640)
 parser.add_argument("--height", type=int, default=480)
 parser.add_argument("--fps", type=int, default=15)
-parser.add_argument("--sensitivity", type=float, default=10.0)
+parser.add_argument("--sensitivity", type=float, default=5.0)
 parser.add_argument("--cooldown", type=float, default=20.0,
                     help="Seconds after the last detected visual motion")
 parser.add_argument("--pre-roll", type=float, default=5.0)
