@@ -103,9 +103,6 @@ audio_error = None
 camera_error = None
 writer_queue = None
 writer_thread = None
-pre_roll = queue.deque(maxlen=max(1, round(args.fps * max(0.0, args.pre_roll)))) if hasattr(queue, "deque") else None
-# deque is imported from collections; keep the rolling buffer bounded by requested preroll.
-from collections import deque
 pre_roll = deque(maxlen=max(1, round(args.fps * max(0.0, args.pre_roll))))
 pre_roll_seconds_for_clip = 0.0
 login_attempts = {}
@@ -128,7 +125,7 @@ table{width:100%;border-collapse:collapse;margin-top:18px}td,th{text-align:left;
 """
 
 LOGIN_PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Pi Motion Cam</title><style>''' + STYLE + r'''</style></head>
-<body><main class="wrap"><section class="card center"><div class="eyebrow">Private camera</div><h1 class="brand">Pi Motion Cam</h1><p class="muted">Enter your four-digit PIN to continue.</p><form method="post" action="{{ url_for('login') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="muted" for="pin">Camera PIN</label><input class="field" id="pin" name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" minlength="4" autocomplete="one-time-code" required autofocus><button class="btn" type="submit" style="width:100%">Unlock camera</button></form><p class="error" role="alert">{{ error }}</p><p class="muted" style="font-size:.85rem">Keep this service on a trusted network. Use HTTPS if accessing it remotely.</p></section></main></body></html>'''
+<body><main class="wrap"><section class="card center"><div class="eyebrow">Private camera</div><h1 class="brand">Pi Motion Cam</h1><p class="muted">Enter your four-digit PIN to continue.</p><form method="post" action="{{ url_for('login') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="muted" for="pin">Camera PIN</label><input class="field" id="pin" name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" minlength="4" autocomplete="one-time-code" required autofocus><button class="btn" type="submit" style="width:100%">Unlock camera</button></form><p class="error" role="alert">{{ error }}</p><p class="muted" style="font-size:.85rem">Keep this service on a trusted network. Use HTTPS if accessing remotely.</p></section></main></body></html>'''
 
 HOME_PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home · Pi Motion Cam</title><style>''' + STYLE + r'''</style></head>
 <body><main class="wrap"><header class="top"><div><div class="eyebrow">Camera dashboard</div><h1 class="brand">Pi Motion Cam</h1></div><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn secondary" type="submit">Lock</button></form></header>
@@ -193,11 +190,31 @@ def add_timestamp(frame):
 
 
 def write_frames(video_writer, frames_queue):
+    first_timestamp = None
+    previous_frame = None
+    last_output_index = -1
+
     while True:
-        frame = frames_queue.get()
-        if frame is None:
+        item = frames_queue.get()
+        if item is None:
             break
+
+        captured_at, frame = item
+        if first_timestamp is None:
+            first_timestamp = captured_at
+
+        target_index = round((captured_at - first_timestamp) * args.fps)
+        if target_index <= last_output_index:
+            continue
+
+        while last_output_index + 1 < target_index:
+            video_writer.write(previous_frame)
+            last_output_index += 1
+
         video_writer.write(frame)
+        previous_frame = frame
+        last_output_index = target_index
+
     video_writer.release()
 
 
@@ -238,6 +255,7 @@ def finish_recording():
         frames_queue.put(None)
     if thread is not None:
         thread.join()
+
     audio_ok = False
     if audio_process is not None:
         process, audio_process = audio_process, None
@@ -249,9 +267,14 @@ def finish_recording():
             process.kill()
             process.wait()
         details = close_audio_log()
-        audio_ok = audio_temp_path is not None and audio_temp_path.exists() and audio_temp_path.stat().st_size > 44
+        audio_ok = (
+            audio_temp_path is not None
+            and audio_temp_path.exists()
+            and audio_temp_path.stat().st_size > 44
+        )
         if not audio_ok:
             camera_error = "No usable audio captured" + (f": {details}" if details else "")
+
     try:
         if video_temp_path is None or not video_temp_path.exists():
             return
@@ -288,43 +311,66 @@ def capture_loop():
     global recording_path, video_temp_path, audio_temp_path, audio_process
     global writer_queue, writer_thread, camera_error, audio_error, pre_roll_seconds_for_clip
     previous_gray = None
+
     while True:
         ok, frame = camera.read()
         if not ok:
             camera_error = "Could not read from the camera"
             time.sleep(0.2)
             continue
-        gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+
+        gray = cv2.GaussianBlur(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+            (21, 21),
+            0,
+        )
         motion = False
         if previous_gray is not None:
             delta = cv2.absdiff(previous_gray, gray)
             _, thresh = cv2.threshold(delta, 25, 255, cv2.THRESH_BINARY)
-            changed = np.count_nonzero(cv2.dilate(thresh, None, iterations=2)) / thresh.size * 100.0
+            changed = (
+                np.count_nonzero(cv2.dilate(thresh, None, iterations=2))
+                / thresh.size
+                * 100.0
+            )
             motion = changed >= args.sensitivity
         previous_gray = gray
         now = time.monotonic()
+
         add_timestamp(frame)
         if motion:
             last_motion = now
+
         with lock:
             latest_frame = frame.copy()
             motion_active = motion
-        ok_jpeg, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+
+        ok_jpeg, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 82],
+        )
         if ok_jpeg:
             with frame_condition:
                 latest_jpeg = encoded.tobytes()
                 frame_id += 1
                 frame_condition.notify_all()
 
-        pre_roll.append(frame.copy())
+        pre_roll.append((now, frame.copy()))
         started = False
+
         if motion and not recording:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             recording_path = recordings_dir / f"motion-{stamp}.mp4"
             video_temp_path = recordings_dir / f".motion-{stamp}.video.mp4"
             audio_temp_path = recordings_dir / f".motion-{stamp}.audio.wav"
-            video_writer = cv2.VideoWriter(str(video_temp_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                                           args.fps, (frame.shape[1], frame.shape[0]))
+
+            video_writer = cv2.VideoWriter(
+                str(video_temp_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                args.fps,
+                (frame.shape[1], frame.shape[0]),
+            )
             if not video_writer.isOpened():
                 video_writer.release()
                 camera_error = "Could not create video file"
@@ -332,14 +378,24 @@ def capture_loop():
             else:
                 writer_queue = queue.Queue()
                 buffered = list(pre_roll)
-                pre_roll_seconds_for_clip = max(0, len(buffered) - 1) / float(args.fps)
-                writer_thread = threading.Thread(target=write_frames,
-                                                 args=(video_writer, writer_queue), daemon=True)
+                if len(buffered) > 1:
+                    pre_roll_seconds_for_clip = buffered[-1][0] - buffered[0][0]
+                else:
+                    pre_roll_seconds_for_clip = 0.0
+
+                writer_thread = threading.Thread(
+                    target=write_frames,
+                    args=(video_writer, writer_queue),
+                    daemon=True,
+                )
                 writer_thread.start()
+
                 with lock:
                     recording = True
-                for buffered_frame in buffered:
-                    writer_queue.put(buffered_frame)
+
+                for buffered_timestamp, buffered_frame in buffered:
+                    writer_queue.put((buffered_timestamp, buffered_frame))
+
                 started = True
                 audio_error = None
                 try:
@@ -350,12 +406,14 @@ def capture_loop():
                     camera_error = audio_error
 
         if recording and writer_queue is not None and not started:
-            writer_queue.put(frame.copy())
+            writer_queue.put((now, frame.copy()))
+
         if audio_process is not None and audio_process.poll() is not None:
             details = close_audio_log()
             audio_process = None
             audio_error = "Audio capture stopped unexpectedly" + (f": {details}" if details else "")
             camera_error = audio_error
+
         if recording and now - last_motion >= args.cooldown:
             finish_recording()
 
@@ -387,7 +445,11 @@ def login():
         else:
             record_login_failure(ip)
             error = "Incorrect PIN. Please try again."
-    return render_template_string(LOGIN_PAGE, error=error, csrf_token=csrf_token())
+    return render_template_string(
+        LOGIN_PAGE,
+        error=error,
+        csrf_token=csrf_token(),
+    )
 
 
 @app.post("/logout")
@@ -424,14 +486,25 @@ def stream():
         last_sent = -1
         while True:
             with frame_condition:
-                frame_condition.wait_for(lambda: frame_id != last_sent and latest_jpeg is not None,
-                                         timeout=5.0)
+                frame_condition.wait_for(
+                    lambda: frame_id != last_sent and latest_jpeg is not None,
+                    timeout=5.0,
+                )
                 current_id, jpeg = frame_id, latest_jpeg
             if jpeg is None:
                 continue
             last_sent = current_id
-            yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n" + jpeg + b"\r\n"
-    response = Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+            yield (
+                b"--frame\r\nContent-Type: image/jpeg\r\n"
+                b"Cache-Control: no-cache\r\n\r\n"
+                + jpeg
+                + b"\r\n"
+            )
+
+    response = Response(
+        frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["X-Accel-Buffering"] = "no"
     return response
@@ -441,26 +514,48 @@ def stream():
 @login_required
 def status():
     with lock:
-        return jsonify(motion=motion_active, recording=recording,
-                       camera_error=camera_error, recording_file=recording_path.name if recording_path else None,
-                       cooldown_seconds=args.cooldown, pre_roll_seconds=args.pre_roll)
+        return jsonify(
+            motion=motion_active,
+            recording=recording,
+            camera_error=camera_error,
+            recording_file=recording_path.name if recording_path else None,
+            cooldown_seconds=args.cooldown,
+            pre_roll_seconds=args.pre_roll,
+        )
 
 
 @app.route("/api/recordings", methods=["GET"])
 @login_required
 def recordings_api():
-    files = sorted(recordings_dir.glob("motion-*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return jsonify([{"name": p.name, "size_mb": round(p.stat().st_size / 1024 / 1024, 2)}
-                    for p in files if p.is_file()])
+    files = sorted(
+        recordings_dir.glob("motion-*.mp4"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return jsonify([
+        {
+            "name": p.name,
+            "size_mb": round(p.stat().st_size / 1024 / 1024, 2),
+        }
+        for p in files
+        if p.is_file()
+    ])
 
 
 @app.route("/api/recordings/<path:name>", methods=["DELETE"])
 @login_required
 def delete_recording(name):
     if not csrf_required():
-        return jsonify(error="Invalid request token; refresh the page and try again"), 400
-    if Path(name).name != name or not name.startswith("motion-") or not name.endswith(".mp4"):
+        return jsonify(
+            error="Invalid request token; refresh the page and try again",
+        ), 400
+    if (
+        Path(name).name != name
+        or not name.startswith("motion-")
+        or not name.endswith(".mp4")
+    ):
         return jsonify(error="Invalid recording name"), 400
+
     path = (recordings_dir / name).resolve()
     with lock:
         if path == recording_path and recording:
@@ -470,7 +565,9 @@ def delete_recording(name):
         try:
             path.unlink()
         except OSError as exc:
-            return jsonify(error=f"Could not delete recording: {exc}"), 500
+            return jsonify(
+                error=f"Could not delete recording: {exc}",
+            ), 500
     return jsonify(deleted=name)
 
 
@@ -480,7 +577,11 @@ def recording_file(name):
     path = (recordings_dir / name).resolve()
     if recordings_dir not in path.parents or not path.is_file():
         return "Not found", 404
-    return send_file(path, mimetype="video/mp4", as_attachment=True)
+    return send_file(
+        path,
+        mimetype="video/mp4",
+        as_attachment=True,
+    )
 
 
 thread = threading.Thread(target=capture_loop, daemon=True)
